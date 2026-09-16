@@ -7,13 +7,10 @@ namespace DisplayXR
 {
     /// <summary>
     /// Boot-splash spawner. The DisplayXR splash is <b>on by default</b>: every
-    /// DisplayXR app shows it at startup with no scene wiring. It spawns before
-    /// the app's first scene loads, occludes the loading scene, plays the logo
-    /// on the zero-disparity plane, then destroys itself to reveal the app.
-    ///
-    /// The splash rig does NOT join DisplayXRRigManager (it owns the projection
-    /// via DisplayXRRigManager.SplashActive instead), so app scripts that bind
-    /// to the active rig latch onto the app's real rig from frame one.
+    /// DisplayXR app shows it at startup with no scene wiring. Overlay mode
+    /// hijacks the scene camera's culling mask (it does NOT spawn a second XR
+    /// camera — destroying one mid-run recreates the eye RTs and hitchs). Then
+    /// it restores the camera and destroys itself.
     ///
     /// Opt out by defining <c>DISPLAYXR_NO_SPLASH</c> (DisplayXR Manifest
     /// Settings ▸ Boot Splash ▸ Disable). When opted out the whole class
@@ -42,18 +39,17 @@ namespace DisplayXR
             if (DisplayXRProvider.s_TransparentBackgroundRequested)
                 return;
 
-            // Built inactive so DisplayXRDisplay.bootSplashOverlay is set before
-            // OnEnable runs (which decides whether to register with the rig
-            // manager). Activated last.
+            // Overlay splash must NOT be a second XR camera. Unity's XR display
+            // provider renders every enabled stereo camera into the eye targets;
+            // creating one here and Destroy()ing it a few seconds later is
+            // XRTextureManager::RequestDestroyTexture — a multi-hundred-ms hitch
+            // (and a 2+ s stall when it coincides with PSO warmup). Hijack the
+            // scene camera's culling mask instead; no extra eye RT is allocated.
             var go = new GameObject("DisplayXR Boot Splash");
-            go.SetActive(false);
             Object.DontDestroyOnLoad(go);
-            go.AddComponent<Camera>();
-            var display = go.AddComponent<DisplayXRDisplay>();
-            display.bootSplashOverlay = true;   // don't register; own the projection
             var splash = go.AddComponent<DisplayXRSplash>();
             splash.overlayMode = true;
-            go.SetActive(true);
+            DisplayXRSplash.OverlayActive = true;
         }
     }
 #endif

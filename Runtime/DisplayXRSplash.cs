@@ -34,8 +34,6 @@ namespace DisplayXR
     ///   underneath); the opaque clear occludes it while the logo plays, then
     ///   the splash destroys itself to reveal the app.
     /// </summary>
-    [RequireComponent(typeof(Camera))]
-    [RequireComponent(typeof(DisplayXRDisplay))]
     public class DisplayXRSplash : MonoBehaviour
     {
         [Header("Logo")]
@@ -80,21 +78,56 @@ namespace DisplayXR
         private Material m_LogoMat;
         private Material m_SubMat;
 
+        /// <summary>
+        /// True while an overlay splash is alive. The provider driver waits on
+        /// this so WarmupAllShaders runs behind the logo instead of freezing
+        /// the first gameplay frames.
+        /// </summary>
+        public static bool OverlayActive { get; internal set; }
+
+        // Overlay mode hijacks the scene camera instead of spawning a second XR
+        // camera. Restored in Finish / OnDestroy.
+        Camera m_Host;
+        int m_SavedMask;
+        bool m_HostHijacked;
+        Transform m_Combo;
+        GameObject m_Cover;
+
         IEnumerator Start()
         {
-            var cam = GetComponent<Camera>();
-            // Render ONLY the splash artwork; clear everything else to the
-            // background so the app scene behind is fully occluded.
-            cam.clearFlags = CameraClearFlags.SolidColor;
-            cam.backgroundColor = background;
-            cam.cullingMask = 1 << k_SplashLayer;
-            if (overlayMode)
-                cam.depth = 100; // render after the app's scene cameras
-
             if (logo == null)
                 logo = Resources.Load<Texture2D>("displayxr_white");
             if (subtitle == null)
                 subtitle = Resources.Load<Texture2D>("for_unity");
+
+            Transform artParent;
+            if (overlayMode)
+            {
+                yield return BindHostCamera();
+                if (m_Host == null)
+                {
+                    Destroy(gameObject);
+                    yield break;
+                }
+                artParent = m_Host.transform;
+                var display = m_Host.GetComponent<DisplayXRDisplay>();
+                if (display != null)
+                    artParent = display.transform;
+                BuildCover(m_Host.transform);
+            }
+            else
+            {
+                var cam = GetComponent<Camera>();
+                if (cam == null)
+                {
+                    Destroy(gameObject);
+                    yield break;
+                }
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = background;
+                cam.cullingMask = 1 << k_SplashLayer;
+                artParent = transform;
+            }
 
             // Wait for the runtime to report display geometry so we can size the
             // logo to the physical display. Fall back after ~2 s. Read the
@@ -112,23 +145,82 @@ namespace DisplayXR
                 yield return null;
             }
 
-            BuildArtwork(displayH);
+            float artZ = 0f;
+            if (overlayMode && m_Host != null && m_Host.GetComponent<DisplayXRDisplay>() == null)
+                artZ = 0.5f; // camera-centric: sit in front of the camera, not inside it
+            BuildArtwork(artParent, displayH, artZ);
 
-            // Fade the logo/subtitle in → hold → out.
+            // Logo up first so WarmupAllShaders' 1–2 s stall is behind it, not
+            // a black freeze. Then keep the real scene in the culling mask for
+            // several frames so URP actually records the XR stereo PSOs
+            // WarmupAllShaders does not create (those were the leftover
+            // 200–270 ms hitches after splash).
             yield return Fade(0f, 1f, fadeIn);
-            yield return new WaitForSeconds(hold);
+            DisplayXRShaderWarmup.Run();
+            for (int i = 0; i < 12; i++)
+                yield return null;
+            DisplayXRShaderWarmup.RunAgain();
+            if (!overlayMode)
+                yield return new WaitForSeconds(hold);
             yield return Fade(1f, 0f, fadeOut);
 
             Finish();
+        }
+
+        IEnumerator BindHostCamera()
+        {
+            float t = 0f;
+            while (t < 2f && m_Host == null)
+            {
+                m_Host = DisplayXRRigManager.ActiveCamera;
+                if (m_Host == null) m_Host = Camera.main;
+                if (m_Host == null) m_Host = FindAnyObjectByType<Camera>();
+                if (m_Host != null) break;
+                t += Time.deltaTime;
+                yield return null;
+            }
+            if (m_Host == null) yield break;
+
+            m_SavedMask = m_Host.cullingMask;
+            // Keep the scene drawing. WarmupAllShaders does not compile URP XR
+            // stereo PSOs — only an actual stereo draw does. An opaque cover
+            // quad hides that work so the logo is all the user sees.
+            m_Host.cullingMask = m_SavedMask | (1 << k_SplashLayer);
+            m_HostHijacked = true;
+        }
+
+        void RestoreHostCamera()
+        {
+            if (m_Cover != null)
+            {
+                Destroy(m_Cover);
+                m_Cover = null;
+            }
+            if (m_Combo != null)
+            {
+                Destroy(m_Combo.gameObject);
+                m_Combo = null;
+            }
+            if (!m_HostHijacked) return;
+            m_HostHijacked = false;
+            if (m_Host == null) return;
+            m_Host.cullingMask = m_SavedMask;
+        }
+
+        void OnDestroy()
+        {
+            if (overlayMode) OverlayActive = false;
+            RestoreHostCamera();
         }
 
         void Finish()
         {
             if (overlayMode)
             {
-                // Reveal the scene loaded underneath. Destroying our rig clears
-                // DisplayXRRigManager.SplashActive, so the app's rig resumes.
-                StartCoroutine(FlushAndDestroy());
+                // No second XR camera to flush. Restore the host camera's mask
+                // and drop the artwork GO — Unity does not recreate eye RTs.
+                RestoreHostCamera();
+                Destroy(gameObject);
                 return;
             }
             if (!string.IsNullOrEmpty(nextScene))
@@ -175,14 +267,31 @@ namespace DisplayXR
             Destroy(gameObject);
         }
 
-        void BuildArtwork(float displayH)
+        void BuildCover(Transform camXf)
+        {
+            // Camera-local opaque quad in front of everything. Overlay queue so
+            // it draws after the real scene's opaques and transparents.
+            m_Cover = new GameObject("Splash Cover");
+            m_Cover.layer = k_SplashLayer;
+            m_Cover.transform.SetParent(camXf, false);
+            m_Cover.transform.localPosition = new Vector3(0f, 0f, camXf.GetComponent<Camera>().nearClipPlane + 0.02f);
+            m_Cover.transform.localRotation = Quaternion.identity;
+            m_Cover.AddComponent<MeshFilter>().sharedMesh = MakeQuad(40f, 40f);
+            var mat = new Material(Shader.Find("Sprites/Default"));
+            mat.color = new Color(background.r, background.g, background.b, 1f);
+            mat.renderQueue = 5000;
+            m_Cover.AddComponent<MeshRenderer>().sharedMaterial = mat;
+        }
+
+        void BuildArtwork(Transform parent, float displayH, float localZ = 0f)
         {
             // Combo parent on the ZDP; children laid out so the group is centered.
             var combo = new GameObject("Splash Combo").transform;
-            combo.SetParent(transform, false);
-            combo.localPosition = Vector3.zero;
+            combo.SetParent(parent, false);
+            combo.localPosition = new Vector3(0f, 0f, localZ);
             combo.localRotation = Quaternion.identity;
             combo.gameObject.layer = k_SplashLayer;
+            m_Combo = combo;
 
             float logoH = Mathf.Max(0.001f, logoHeightFraction * displayH);
             float logoW = logoH * Aspect(logo, 1f);

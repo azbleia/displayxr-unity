@@ -396,6 +396,9 @@ typedef struct ProviderSession {
 	ID3D12Device              *own_device;
 	ID3D12CommandQueue        *own_queue;
 	ID3D12CommandAllocator    *own_cmd_alloc;
+	ID3D12CommandAllocator    *own_cmd_alloc_ring[2];
+	UINT64                     own_cmd_alloc_fence[2];
+	int                        own_cmd_i;
 	ID3D12GraphicsCommandList *own_cmd_list;
 	ID3D12Fence               *own_fence;
 	HANDLE                     own_fence_event;
@@ -1529,6 +1532,68 @@ static int ps_d3d11_check_requirements(void)
 	return 1;
 }
 
+// Two command allocators so Reset never CPU-waits on last frame's copy.
+// A single allocator forced WaitForSingleObject(INFINITE) before every
+// submit — that serialized Unity's queue behind the previous copy and
+// showed up as 200–270 ms stalls with an idle GPU.
+static int ps_d3d12_create_cmd_objects(void)
+{
+	for (int i = 0; i < 2; i++) {
+		s_ps.own_cmd_alloc_ring[i] = NULL;
+		s_ps.own_cmd_alloc_fence[i] = 0;
+		if (FAILED(s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+		        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc_ring[i])) ||
+		    !s_ps.own_cmd_alloc_ring[i])
+			return 0;
+	}
+	s_ps.own_cmd_i = 0;
+	s_ps.own_cmd_alloc = s_ps.own_cmd_alloc_ring[0];
+	if (FAILED(s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
+	        (void **)&s_ps.own_cmd_list)) || !s_ps.own_cmd_list)
+		return 0;
+	s_ps.own_cmd_list->Close();
+	if (FAILED(s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence)) || !s_ps.own_fence)
+		return 0;
+	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	s_ps.own_fence_value = 0;
+	return s_ps.own_fence_event != NULL;
+}
+
+static int ps_d3d12_begin_cmd(void)
+{
+	if (!s_ps.own_cmd_list || !s_ps.own_cmd_alloc_ring[0] || !s_ps.own_cmd_alloc_ring[1])
+		return 0;
+	int i = s_ps.own_cmd_i;
+	UINT64 need = s_ps.own_cmd_alloc_fence[i];
+	if (need != 0 && s_ps.own_fence && s_ps.own_fence_event &&
+	    s_ps.own_fence->GetCompletedValue() < need) {
+		s_ps.own_fence->SetEventOnCompletion(need, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	s_ps.own_cmd_alloc = s_ps.own_cmd_alloc_ring[i];
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	return 1;
+}
+
+static void ps_d3d12_execute_cmd(int wait_cpu)
+{
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	s_ps.own_cmd_alloc_fence[s_ps.own_cmd_i] = s_ps.own_fence_value;
+	s_ps.own_cmd_i ^= 1;
+	if (wait_cpu && s_ps.own_fence && s_ps.own_fence_event &&
+	    s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+}
+
 // Create the session's OWN D3D12 device on the runtime's adapter LUID, plus a
 // queue + command list + fence for the per-frame bridge→swapchain copy.
 // (Mirrors displayxr_standalone_d3d12.cpp create_device.)
@@ -1568,17 +1633,7 @@ static int ps_alias_unity_device_d3d12(void)
 	}
 	s_ps.own_device = s_ps.unity_device; s_ps.own_device->AddRef();
 	s_ps.own_queue  = s_ps.unity_queue;  s_ps.own_queue->AddRef();
-	s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-	        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc);
-	s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
-	        (void **)&s_ps.own_cmd_list);
-	if (s_ps.own_cmd_list) s_ps.own_cmd_list->Close();
-	s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence);
-	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-	s_ps.own_fence_value = 0;
-	if (!s_ps.own_cmd_alloc || !s_ps.own_cmd_list || !s_ps.own_fence) {
+	if (!ps_d3d12_create_cmd_objects()) {
 		ps_log("[DisplayXR-PROV] shell alias: cmd/fence create failed\n");
 		return 0;
 	}
@@ -1643,21 +1698,15 @@ static int ps_create_own_device(void)
 
 	D3D12_COMMAND_QUEUE_DESC qd = {};
 	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-	if (FAILED(s_ps.own_device->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+	if (FAILED(	s_ps.own_device->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
 	        (void **)&s_ps.own_queue))) {
 		ps_log("[DisplayXR-PROV] CreateCommandQueue (own) failed\n");
 		return 0;
 	}
-	s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-	        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc);
-	s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
-	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
-	        (void **)&s_ps.own_cmd_list);
-	s_ps.own_cmd_list->Close();
-	s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
-	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence);
-	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-	s_ps.own_fence_value = 0;
+	if (!ps_d3d12_create_cmd_objects()) {
+		ps_log("[DisplayXR-PROV] Own D3D12 cmd/fence create failed\n");
+		return 0;
+	}
 	ps_log("[DisplayXR-PROV] Own D3D12 device + queue created (runtime session device)\n");
 	return 1;
 }
@@ -2583,8 +2632,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	} else
 	// own_device copy bridge -> swapchain image (single subresource).
 	if (s_ps.wsui_images[idx].texture && s_ps.own_cmd_list) {
-		s_ps.own_cmd_alloc->Reset();
-		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		if (!ps_d3d12_begin_cmd()) return 0;
 		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
 		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
@@ -2596,15 +2644,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
 		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		s_ps.own_cmd_list->Close();
-		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-		s_ps.own_queue->ExecuteCommandLists(1, lists);
-		s_ps.own_fence_value++;
-		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-		}
+		ps_d3d12_execute_cmd(1); // must finish before xrReleaseSwapchainImage
 	}
 
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -2896,8 +2936,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 			s_ps.unity_d3d11_context->CopyResource(s_ps.l2d_images_d3d11[idx].texture, s_ps.l2d_unity_tex);
 	} else
 	if (s_ps.l2d_images[idx].texture && s_ps.own_cmd_list) {
-		s_ps.own_cmd_alloc->Reset();
-		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		if (!ps_d3d12_begin_cmd()) return 0;
 		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
 		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
@@ -2909,15 +2948,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
 		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		s_ps.own_cmd_list->Close();
-		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-		s_ps.own_queue->ExecuteCommandLists(1, lists);
-		s_ps.own_fence_value++;
-		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-		}
+		ps_d3d12_execute_cmd(1); // must finish before xrReleaseSwapchainImage
 	}
 
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
@@ -3276,8 +3307,7 @@ static void ps_copy_extra_zone(ProviderExtraZone *z)
 	ID3D12Resource *dst = z->sc_images[z->acquired_index].texture;
 	ID3D12Resource *copy_src = sp ? z->bridge_own : z->bridge_own_eye[0];
 	if (dst && copy_src && s_ps.own_cmd_list) {
-		s_ps.own_cmd_alloc->Reset();
-		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		if (!ps_d3d12_begin_cmd()) return;
 		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		for (UINT slice = 0; slice < 2; slice++) {
@@ -3287,20 +3317,12 @@ static void ps_copy_extra_zone(ProviderExtraZone *z)
 		}
 		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
-		s_ps.own_cmd_list->Close();
 		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
 			s_ps.sync_val++;
 			s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
 			s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
 		}
-		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-		s_ps.own_queue->ExecuteCommandLists(1, lists);
-		s_ps.own_fence_value++;
-		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-		}
+		ps_d3d12_execute_cmd(1); // must finish before xrReleaseSwapchainImage
 	}
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
@@ -3689,8 +3711,7 @@ static void ps_probe_dump_d3d12(const char *path)
 	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) {
 		ps_log("[DisplayXR-PROV] PROBE: D3D12 readback buffer create failed\n"); return;
 	}
-	s_ps.own_cmd_alloc->Reset();
-	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	if (!ps_d3d12_begin_cmd()) { rb->Release(); return; }
 	D3D12_RESOURCE_BARRIER b = {};
 	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	b.Transition.pResource = s_probe_tex12; b.Transition.Subresource = 0;
@@ -3706,15 +3727,7 @@ static void ps_probe_dump_d3d12(const char *path)
 	b2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
 	b2.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 	s_ps.own_cmd_list->ResourceBarrier(1, &b2);
-	s_ps.own_cmd_list->Close();
-	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-	s_ps.own_queue->ExecuteCommandLists(1, lists);
-	s_ps.own_fence_value++;
-	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-	}
+	ps_d3d12_execute_cmd(1);
 	void *p = NULL; D3D12_RANGE range = {0, (SIZE_T)total};
 	if (SUCCEEDED(rb->Map(0, &range, &p)) && p) {
 		ps_write_bmp_bgra(path, (uint32_t)rd.Width, (uint32_t)rd.Height,
@@ -4697,7 +4710,12 @@ void dxr_prov_session_stop(void)
 	if (s_ps.own_fence_event) CloseHandle(s_ps.own_fence_event);
 	if (s_ps.own_fence)       s_ps.own_fence->Release();
 	if (s_ps.own_cmd_list)    s_ps.own_cmd_list->Release();
-	if (s_ps.own_cmd_alloc)   s_ps.own_cmd_alloc->Release();
+	for (int i = 0; i < 2; i++) {
+		if (s_ps.own_cmd_alloc_ring[i]) s_ps.own_cmd_alloc_ring[i]->Release();
+		s_ps.own_cmd_alloc_ring[i] = NULL;
+		s_ps.own_cmd_alloc_fence[i] = 0;
+	}
+	s_ps.own_cmd_alloc = NULL;
 	if (s_ps.own_queue)       s_ps.own_queue->Release();
 	if (s_ps.own_device)      s_ps.own_device->Release();
 
@@ -6286,8 +6304,7 @@ static void ps_diag_readback_bridge_once(void)
 	ID3D12Resource *rb = NULL;
 	if (FAILED(s_ps.own_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
 	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) return;
-	s_ps.own_cmd_alloc->Reset();
-	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	if (!ps_d3d12_begin_cmd()) { rb->Release(); return; }
 	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 	b.Transition.pResource = br; b.Transition.Subresource = 0;
 	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
@@ -6308,15 +6325,7 @@ static void ps_diag_readback_bridge_once(void)
 	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
 	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
 	s_ps.own_cmd_list->ResourceBarrier(1, &b);
-	s_ps.own_cmd_list->Close();
-	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-	s_ps.own_queue->ExecuteCommandLists(1, lists);
-	s_ps.own_fence_value++;
-	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-	}
+	ps_d3d12_execute_cmd(1);
 	void *p = NULL; D3D12_RANGE mr = {0, rowPitch};
 	if (SUCCEEDED(rb->Map(0, &mr, &p)) && p) {
 		UINT8 *px = (UINT8 *)p + ((UINT)rd.Width / 2) * 4;
@@ -6344,8 +6353,7 @@ static void ps_diag_preclear_bridge_green(void)
 	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 	int sp = dxr_prov_get_single_pass();
-	s_ps.own_cmd_alloc->Reset();
-	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	if (!ps_d3d12_begin_cmd()) return;
 	D3D12_CPU_DESCRIPTOR_HANDLE base = gh->GetCPUDescriptorHandleForHeapStart();
 	auto clear_slice = [&](ID3D12Resource *br, UINT slice, UINT heapIdx) {
 		if (!br) return;
@@ -6364,15 +6372,7 @@ static void ps_diag_preclear_bridge_green(void)
 	};
 	if (sp) { clear_slice(s_ps.bridge_own, 0, 0); clear_slice(s_ps.bridge_own, 1, 1); } // SPI arr=2 bridge
 	else    { clear_slice(s_ps.bridge_own_eye[0], 0, 0); clear_slice(s_ps.bridge_own_eye[1], 0, 1); } // MultiPass
-	s_ps.own_cmd_list->Close();
-	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-	s_ps.own_queue->ExecuteCommandLists(1, lists);
-	s_ps.own_fence_value++;
-	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
-	}
+	ps_d3d12_execute_cmd(1);
 	static int logged = 0;
 	if (!logged) { logged = 1; ps_log("[DisplayXR-PROV] PROBE: BRIDGE PRECLEAR green (before Unity render)\n"); }
 }
@@ -6478,8 +6478,12 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		if (copy_src && image_index < s_ps.sc_image_count &&
 		    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
 			ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
-			s_ps.own_cmd_alloc->Reset();
-			s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+			// Ring of 2 allocators: Reset waits only if this slot is still in
+			// flight (two frames old). Same-device skip of the post-Execute CPU
+			// wait is unchanged — xrEndFrame is queued after the copy.
+			if (!ps_d3d12_begin_cmd()) {
+				ps_log("[DisplayXR-PROV] submit_frame: D3D12 cmd begin failed\n");
+			} else {
 			// DIAGNOSTIC: instead of the real eye copies, paint slice 0 = BLUE, slice 1 = RED
 			// so the woven output reveals whether the runtime's texture-mode weave reads both
 			// array slices (blue/red interlace) or only slice 0 (flat all-blue). See helper.
@@ -6518,7 +6522,6 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 				                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			}
-			s_ps.own_cmd_list->Close();
 
 			// Cross-device sync: signal a SHARED fence on Unity's queue (ordered after
 			// Unity's already-submitted render into the bridge — Unity's queue is FIFO)
@@ -6530,13 +6533,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
 			}
 
-			ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-			s_ps.own_queue->ExecuteCommandLists(1, lists);
-			s_ps.own_fence_value++;
-			s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-			if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-				s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-				WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+			// Cross-device (own_queue != Unity's): the compositor does not wait
+			// on our queue, so the CPU must drain the copy before xrEndFrame.
+			// Same-device (shell alias, ADR-032): skip — the ring waits at the
+			// next begin_cmd, overlapping this copy with Unity's next render.
+			ps_d3d12_execute_cmd(s_ps.own_queue != s_ps.unity_queue);
 			}
 		}
 	}

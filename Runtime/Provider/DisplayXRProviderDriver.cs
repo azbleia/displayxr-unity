@@ -1,6 +1,7 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 
+using System.Collections;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using UnityEngine;
@@ -72,6 +73,17 @@ namespace DisplayXR
             DisplayXRDepthBudget.Reset();
         }
 
+        IEnumerator CoWarmupShaders()
+        {
+            // Overlay splash owns the warmup so the stall sits behind the logo.
+            // Transparent / DISPLAYXR_NO_SPLASH apps still need a post-session
+            // warmup here.
+            while (DisplayXRSplash.OverlayActive)
+                yield return null;
+            yield return null;
+            DisplayXRShaderWarmup.Run();
+        }
+
         void LateUpdate()
         {
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
@@ -112,6 +124,7 @@ namespace DisplayXR
                 DisplayXRProviderNative.dxr_prov_get_display_info(out var di);
                 m_DisplayHeightM = di.isValid != 0 ? di.heightM : 0f;
                 DisplayXRProvider.OnSessionStarted();
+                StartCoroutine(CoWarmupShaders());
             }
 
             DisplayXRProvider.PumpEvents();
